@@ -1,0 +1,1 @@
+hacer que eel plugin capture el BPM de la musica cada cierto tiempo para que se vaya actualizando a tiempo real segun el ritmo cambiante de la cancion, y asi los gifs se sincronicen mejor con la musica. 
