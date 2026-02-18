@@ -1,7 +1,7 @@
 # My Lazy Plugins for Noctalia
 
 Colección de tres plugins para **Noctalia Shell** en el compositor de ventanas **Niri**.  
-Desarrollados por **MIKURI** · Licencia MIT
+Desarrollados por **RosariosTijeras** · Licencia MIT
 
 ---
 
