@@ -5,9 +5,12 @@
   "minNoctaliaVersion": "3.6.0",
   "author": "RosariosTijeras",
   "license": "MIT",
-  "repository": "tu ano",
+  "repository": "https://github.com/RosariosTijeras/Mona-china-bailando-plugin-noctalia",
   "description": "Display animated GIFs on your desktop.",
-  "tags": ["Desktop", "Fun"],
+  "tags": [
+    "Desktop",
+    "Fun"
+  ],
   "entryPoints": {
     "desktopWidget": "DesktopWidget.qml",
     "settings": "Settings.qml"
