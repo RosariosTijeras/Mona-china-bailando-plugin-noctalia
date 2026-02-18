@@ -3,6 +3,7 @@ import QtQuick.Layouts
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
+import Qt.labs.folderlistmodel
 import qs.Commons
 import qs.Widgets
 import qs.Services.UI
@@ -12,137 +13,46 @@ ColumnLayout {
     spacing: Style.marginL
 
     property var pluginApi: null
-    property var gifs: []
-    
-    property string inputName: ""
-    property string inputUrl: ""
-    property bool downloading: false
-    property string statusMsg: ""
 
-    // Reload GIFs from settings
-    function reloadGifs() {
-        var raw = pluginApi?.pluginSettings?.gifs
-        if (raw) {
-            gifs = JSON.parse(JSON.stringify(raw))
-        } else {
-            gifs = []
-        }
+    // ── Carpeta de GIFs ────────────────────────────────────────────────────
+    readonly property string gifsFolder: {
+        try {
+            if (!pluginApi || !pluginApi.pluginDir) return ""
+            return pluginApi.pluginDir + "/gifs"
+        } catch(e) { return "" }
     }
 
-    // Save settings
-    function saveSettings() {
-        if (!pluginApi) return
-        pluginApi.pluginSettings.gifs = gifs
-        pluginApi.saveSettings()
+    // Escanea la carpeta gifs/ en tiempo real
+    FolderListModel {
+        id: gifFolderModel
+        folder: root.gifsFolder ? ("file://" + root.gifsFolder) : ""
+        nameFilters: ["*.gif", "*.GIF"]
+        showDirs: false
+        showDotAndDotDot: false
+        showHidden: false
+        sortField: FolderListModel.Name
     }
 
-    // Add new GIF
-    function addGif() {
-        var name = inputName.trim()
-        var url = inputUrl.trim()
-        
-        if (!name || !url) {
-            statusMsg = "Ingresa nombre y URL"
-            return
+    // Lista de nombres de archivo en la carpeta
+    property var folderFiles: {
+        var files = []
+        for (var i = 0; i < gifFolderModel.count; i++) {
+            var fp = gifFolderModel.get(i, "filePath")
+            if (fp) files.push(fp.split("/").pop())
         }
-        
-        var id = Date.now().toString()
-        var filename = id + ".gif"
-        var path = pluginApi.pluginDir + "/gifs/" + filename
-        
-        var newGif = {
-            id: id,
-            name: name,
-            url: url,
-            filename: filename,
-            active: false,
-            downloaded: false
-        }
-        
-        gifs.push(newGif)
-        saveSettings()
-        reloadGifs()
-        
-        inputName = ""
-        inputUrl = ""
-        downloading = true
-        statusMsg = "Descargando..."
-        
-        downloadProc.gifId = id
-        downloadProc.command = ["curl", "-L", "-o", path, url]
-        downloadProc.running = true
+        return files
     }
 
-    // Toggle active state
-    function toggleActive(index) {
-        if (index < 0 || index >= gifs.length) return
-        gifs[index].active = !gifs[index].active
-        saveSettings()
-        reloadGifs()
-        
-        var name = gifs[index].name
-        if (gifs[index].active) {
-            ToastService.showNotice(name + " activado")
-        } else {
-            ToastService.showNotice(name + " desactivado")
-        }
-    }
-
-    // Delete GIF
-    function deleteGif(index) {
-        if (index < 0 || index >= gifs.length) return
-        
-        var gif = gifs[index]
-        var path = pluginApi.pluginDir + "/gifs/" + gif.filename
-        
-        gifs.splice(index, 1)
-        saveSettings()
-        reloadGifs()
-        
-        deleteProc.command = ["rm", "-f", path]
+    function deleteGif(filename) {
+        // Borrar archivo
+        deleteProc.command = ["rm", "-f", gifsFolder + "/" + filename]
         deleteProc.running = true
-        
-        ToastService.showNotice(gif.name + " eliminado")
+        ToastService.showNotice(filename + " eliminado")
     }
 
-    // Processes
     Process {
         id: mkdirProc
         running: false
-    }
-
-    Process {
-        id: downloadProc
-        property string gifId: ""
-        running: false
-        onExited: function(code) {
-            downloading = false
-            
-            if (code === 0) {
-                // Mark as downloaded
-                for (var i = 0; i < gifs.length; i++) {
-                    if (gifs[i].id === gifId) {
-                        gifs[i].downloaded = true
-                        break
-                    }
-                }
-                saveSettings()
-                reloadGifs()
-                statusMsg = "✓ Descargado"
-                ToastService.showNotice("GIF agregado")
-            } else {
-                // Remove failed download
-                for (var i = 0; i < gifs.length; i++) {
-                    if (gifs[i].id === gifId) {
-                        gifs.splice(i, 1)
-                        break
-                    }
-                }
-                saveSettings()
-                reloadGifs()
-                statusMsg = "✗ Error al descargar"
-            }
-        }
     }
 
     Process {
@@ -150,10 +60,36 @@ ColumnLayout {
         running: false
     }
 
-    Component.onCompleted: {
-        if (!pluginApi.pluginSettings.gifs) {
-            pluginApi.pluginSettings.gifs = []
+    // Proceso para copiar archivos desde el selector
+    Process {
+        id: copyProc
+        property string targetFilename: ""
+        running: false
+        onExited: function(code) {
+            if (code === 0) {
+                ToastService.showNotice("GIF agregado: " + targetFilename)
+            } else {
+                ToastService.showNotice("Error al copiar archivo")
+            }
         }
+    }
+
+    function addGifFromPath(srcPath) {
+        if (srcPath === "" || (!srcPath.toLowerCase().endsWith(".gif"))) {
+            ToastService.showNotice("El archivo debe ser .gif")
+            return false
+        }
+        
+        var filename = srcPath.split("/").pop()
+        var destPath = root.gifsFolder + "/" + filename
+        
+        copyProc.targetFilename = filename
+        copyProc.command = ["cp", srcPath, destPath]
+        copyProc.running = true
+        return true
+    }
+
+    Component.onCompleted: {
         if (!pluginApi.pluginSettings.gifFPS) {
             pluginApi.pluginSettings.gifFPS = 33.33
         }
@@ -163,13 +99,15 @@ ColumnLayout {
         if (pluginApi.pluginSettings.manualBPM === undefined) {
             pluginApi.pluginSettings.manualBPM = -1
         }
-        if (pluginApi.pluginSettings.bpmApiKey === undefined) {
-            pluginApi.pluginSettings.bpmApiKey = ""
+        if (pluginApi.pluginSettings.bpmCaptureSecs === undefined) {
+            pluginApi.pluginSettings.bpmCaptureSecs = 5
         }
+        // Inicializar objeto de metadatos de GIFs si no existe
+        if (!pluginApi.pluginSettings.gifsMetadata) {
+            pluginApi.pluginSettings.gifsMetadata = {}
         }
         mkdirProc.command = ["mkdir", "-p", pluginApi.pluginDir + "/gifs"]
         mkdirProc.running = true
-        reloadGifs()
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -184,10 +122,10 @@ ColumnLayout {
     }
 
     NText {
-        text: "Agrega GIFs, actívalos con el checkbox, luego agrega widgets al escritorio"
+        text: "Agrega GIFs aquí, luego en cada widget (modo edición) elige qué GIF mostrar. Los widgets SIEMPRE recordarán su GIF asignado."
         pointSize: Style.fontSizeS
         color: Color.mOnSurface
-        opacity: 0.7
+ opacity: 0.7
         wrapMode: Text.WordWrap
         Layout.fillWidth: true
     }
@@ -203,7 +141,7 @@ ColumnLayout {
     }
 
     NText {
-        text: "El BPM se obtiene automáticamente via GetSongBPM API. Ve a getsongbpm.com/api, rellena el formulario (URL de tu proyecto o 'personal'), pon un backlink visible a getsongbpm.com, usa tu email y envíalo. Recibirás la API key por email (límite: 3000 req/hora)."
+        text: "El BPM se detecta automáticamente del audio del sistema via PipeWire + aubio. Funciona con cualquier fuente (Spotify, YouTube, VLC, etc). Requiere el paquete 'aubio' instalado."
         pointSize: Style.fontSizeS
         color: Color.mOnSurface
         opacity: 0.7
@@ -213,13 +151,17 @@ ColumnLayout {
 
     NTextInput {
         Layout.fillWidth: true
-        label: "API Key de GetSongBPM"
-        description: "getsongbpm.com → Register → API Key"
-        placeholderText: "tu_api_key_aquí"
-        text: pluginApi?.pluginSettings?.bpmApiKey ?? ""
+        label: "Segundos de captura"
+        description: "Cuántos segundos de audio analizar para detectar BPM (menos = más rápido)"
+        placeholderText: "5"
+        text: (pluginApi?.pluginSettings?.bpmCaptureSecs ?? 5).toString()
+        inputMethodHints: Qt.ImhFormattedNumbersOnly
         onTextChanged: {
-            pluginApi.pluginSettings.bpmApiKey = text.trim()
-            pluginApi.saveSettings()
+            var v = parseInt(text)
+            if (v >= 3 && v <= 30) {
+                pluginApi.pluginSettings.bpmCaptureSecs = v
+                pluginApi.saveSettings()
+            }
         }
     }
 
@@ -271,192 +213,223 @@ ColumnLayout {
 
     NDivider { Layout.fillWidth: true }
 
-    // Add GIF
+    // ── Ruta de la carpeta ────────────────────────────────────────────────
     NText {
-        text: "Agregar GIF"
+        text: "Carpeta de GIFs"
         pointSize: Style.fontSizeM
         font.weight: Font.DemiBold
         color: Color.mOnSurface
     }
 
-    NTextInput {
+    NText {
+        text: root.gifsFolder || "(no disponible)"
+        pointSize: Style.fontSizeS
+        color: Color.mPrimary
+        wrapMode: Text.WrapAnywhere
         Layout.fillWidth: true
-        label: "Nombre"
-        placeholderText: "Ej. Gato bailando"
-        text: root.inputName
-        onTextChanged: root.inputName = text
-        enabled: !root.downloading
     }
 
-    NTextInput {
-        Layout.fillWidth: true
-        label: "URL del GIF"
-        description: "URL directa terminada en .gif"
-        placeholderText: "https://..."
-        text: root.inputUrl
-        onTextChanged: root.inputUrl = text
-        enabled: !root.downloading
+    NText {
+        text: "Método 1: Pega la ruta completa del archivo"
+        pointSize: Style.fontSizeS
+        color: Color.mOnSurface
+        opacity: 0.7
     }
 
     RowLayout {
         Layout.fillWidth: true
-        
-        NText {
-            text: root.statusMsg
-            pointSize: Style.fontSizeS
-            color: Color.mOnSurface
+        spacing: Style.marginM
+
+        NTextInput {
+            id: manualPathInput
             Layout.fillWidth: true
-            visible: root.statusMsg !== ""
+            placeholderText: "/ruta/completa/al/archivo.gif o ~/Downloads/catjam.gif"
         }
-        
-        Item { Layout.fillWidth: true; visible: root.statusMsg === "" }
-        
+
         NButton {
-            text: root.downloading ? "Descargando..." : "Agregar"
-            enabled: !root.downloading && root.inputName !== "" && root.inputUrl !== ""
-            onClicked: root.addGif()
+            text: "Agregar"
+            enabled: manualPathInput.text.trim() !== ""
+            onClicked: {
+                var srcPath = manualPathInput.text.trim()
+                // Expandir ~ usando variable de ambiente HOME
+                if (srcPath.startsWith("~/")) {
+                    var homeDir = Quickshell.env("HOME") || "/home"
+                    srcPath = homeDir + srcPath.substring(1)
+                }
+                if (root.addGifFromPath(srcPath)) {
+                    manualPathInput.text = ""
+                }
+            }
+        }
+    }
+
+    NText {
+        text: "Método 2: Copia el archivo directamente a la carpeta"
+        pointSize: Style.fontSizeS
+        color: Color.mOnSurface
+        opacity: 0.7
+    }
+
+    Rectangle {
+        Layout.fillWidth: true
+        height: Math.round(80)
+        color: Qt.rgba(1, 1, 1, 0.05)
+        radius: Style.radiusM
+        border.color: Color.mPrimary
+        border.width: 2
+
+        ColumnLayout {
+            anchors.centerIn: parent
+            spacing: 8
+
+            NIcon {
+                icon: "folder-open"
+                color: Color.mPrimary
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            NText {
+                text: root.gifsFolder
+                pointSize: Style.fontSizeXS
+                color: Color.mOnSurface
+                opacity: 0.7
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            NButton {
+                text: "Abrir carpeta"
+                Layout.alignment: Qt.AlignHCenter
+                onClicked: {
+                    Qt.openUrlExternally("file://" + root.gifsFolder)
+                }
+            }
         }
     }
 
     NDivider { Layout.fillWidth: true }
 
-    // GIF List
+    // ── Lista de GIFs detectados ──────────────────────────────────────────
     NText {
-        text: "GIFs (" + root.gifs.length + ")"
+        text: "GIFs disponibles (" + root.folderFiles.length + ")"
         pointSize: Style.fontSizeM
         font.weight: Font.DemiBold
         color: Color.mOnSurface
     }
 
     NText {
-        visible: root.gifs.length === 0
-        text: "No hay GIFs todavía"
+        visible: root.folderFiles.length === 0
+        text: "No hay GIFs en la carpeta"
         pointSize: Style.fontSizeS
         color: Color.mOnSurface
         opacity: 0.4
     }
 
     Repeater {
-        model: root.gifs
+        model: root.folderFiles
 
-        RowLayout {
+        ColumnLayout {
             required property int index
-            property var gif: root.gifs[index]
+            property string filename: root.folderFiles[index]
 
             Layout.fillWidth: true
-            spacing: Style.marginM
+            spacing: Style.marginS
 
-            // Checkbox
-            CheckBox {
-                checked: gif.active || false
-                enabled: gif.downloaded || false
-                onToggled: root.toggleActive(index)
-                
-                indicator: Rectangle {
-                    width: 20
-                    height: 20
-                    radius: 4
-                    border.color: Color.mPrimary
-                    border.width: 2
-                    color: "transparent"
-                    
-                    Rectangle {
-                        width: 12
-                        height: 12
-                        anchors.centerIn: parent
-                        radius: 2
-                        color: Color.mPrimary
-                        visible: parent.parent.checked
-                    }
-                }
-            }
-
-            // Preview thumbnail
-            Rectangle {
-                width: 64
-                height: 48
-                radius: Style.radiusS
-                color: Qt.rgba(0, 0, 0, 0.25)
-                clip: true
-                
-                AnimatedImage {
-                    anchors.fill: parent
-                    source: gif.downloaded 
-                            ? Qt.resolvedUrl("file://" + pluginApi.pluginDir + "/gifs/" + gif.filename)
-                            : ""
-                    fillMode: Image.PreserveAspectCrop
-                    playing: true
-                    smooth: true
-                    cache: false
-                    visible: gif.downloaded && status === AnimatedImage.Ready
-                }
-                
-                NIcon {
-                    anchors.centerIn: parent
-                    icon: gif.downloaded ? "photo" : "clock"
-                    color: Color.mOnSurface
-                    opacity: 0.35
-                    visible: !gif.downloaded || parent.children[0].status !== AnimatedImage.Ready
-                }
-            }
-
-            // Name + status
-            ColumnLayout {
+            RowLayout {
                 Layout.fillWidth: true
-                spacing: 4
+                spacing: Style.marginM
 
-                NText {
-                    Layout.fillWidth: true
-                    text: gif.name
-                    pointSize: Style.fontSizeS
-                    color: Color.mOnSurface
-                    font.weight: gif.active ? Font.DemiBold : Font.Normal
-                    elide: Text.ElideRight
+                // Preview thumbnail
+                Rectangle {
+                    width: 64
+                    height: 48
+                    radius: Style.radiusS
+                    color: Qt.rgba(0, 0, 0, 0.25)
+                    clip: true
+
+                    AnimatedImage {
+                        anchors.fill: parent
+                        source: "file://" + root.gifsFolder + "/" + filename
+                        fillMode: Image.PreserveAspectCrop
+                        playing: true
+                        smooth: true
+                        cache: false
+                        visible: status === AnimatedImage.Ready
+                    }
+
+                    NIcon {
+                        anchors.centerIn: parent
+                        icon: "photo"
+                        color: Color.mOnSurface
+                        opacity: 0.35
+                        visible: parent.children[0].status !== AnimatedImage.Ready
+                    }
                 }
 
-                RowLayout {
-                    spacing: Style.marginS
-                    
-                    Rectangle {
-                        visible: gif.active && gif.downloaded
-                        width: lblActive.implicitWidth + 8
-                        height: lblActive.implicitHeight + 4
-                        radius: height / 2
-                        color: Color.mPrimary
-                        
-                        NText {
-                            id: lblActive
-                            anchors.centerIn: parent
-                            text: "ACTIVO"
-                            color: "#fff"
-                            pointSize: Style.fontSizeXS
-                            font.weight: Font.Bold
+                // Nombre del archivo
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    NText {
+                        Layout.fillWidth: true
+                        text: filename.replace(/\.gif$/i, "")
+                        pointSize: Style.fontSizeS
+                        color: Color.mOnSurface
+                        elide: Text.ElideRight
+                    }
+
+                    NText {
+                        text: filename
+                        pointSize: Style.fontSizeXS
+                        color: Color.mOnSurface
+                        opacity: 0.5
+                        elide: Text.ElideRight
+                    }
+                }
+
+                // Campo FPS
+                NTextInput {
+                    Layout.preferredWidth: 80
+                    label: "FPS"
+                    placeholderText: "30"
+                    text: {
+                        try {
+                            var metadata = pluginApi?.pluginSettings?.gifsMetadata
+                            if (metadata && metadata[filename] && metadata[filename].fps) {
+                                return metadata[filename].fps.toString()
+                            }
+                        } catch(e) {}
+                        return ""
+                    }
+                    inputMethodHints: Qt.ImhFormattedNumbersOnly
+                    onTextChanged: {
+                        var fps = parseFloat(text)
+                        if (fps > 0 && fps <= 200) {
+                            if (!pluginApi.pluginSettings.gifsMetadata) {
+                                pluginApi.pluginSettings.gifsMetadata = {}
+                            }
+                            if (!pluginApi.pluginSettings.gifsMetadata[filename]) {
+                                pluginApi.pluginSettings.gifsMetadata[filename] = {}
+                            }
+                            pluginApi.pluginSettings.gifsMetadata[filename].fps = fps
+                            pluginApi.saveSettings()
                         }
                     }
-                    
-                    Rectangle {
-                        visible: !gif.downloaded
-                        width: lblDl.implicitWidth + 8
-                        height: lblDl.implicitHeight + 4
-                        radius: height / 2
-                        color: Qt.rgba(1, 1, 1, 0.1)
-                        
-                        NText {
-                            id: lblDl
-                            anchors.centerIn: parent
-                            text: "DESCARGANDO..."
-                            color: Color.mOnSurface
-                            opacity: 0.55
-                            pointSize: Style.fontSizeXS
-                        }
-                    }
+                }
+
+                // Eliminar
+                NButton {
+                    text: "Eliminar"
+                    onClicked: root.deleteGif(filename)
                 }
             }
 
-            // Delete
-            NButton {
-                text: "Eliminar"
-                onClicked: root.deleteGif(index)
+            // Separador entre GIFs
+            Rectangle {
+                Layout.fillWidth: true
+                height: 1
+                color: Color.mOnSurface
+                opacity: 0.1
             }
         }
     }
