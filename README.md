@@ -282,3 +282,9 @@ media-panel/
 
 plugins-install.sh
 ```
+
+---
+
+## Créditos
+
+GIFs animados obtenidos mediante [Giphy](https://giphy.com) · Powered by Giphy
