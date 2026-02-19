@@ -74,6 +74,33 @@ ColumnLayout {
         }
     }
 
+    // Proceso para abrir explorador de archivos
+    Process {
+        id: openFolderProc
+        running: false
+    }
+
+    // Proceso para detectar FPS del GIF
+    Process {
+        id: detectFpsProc
+        property string targetFilename: ""
+        running: false
+        stdout: SplitParser {
+            onRead: function(line) {
+                var fps = parseFloat(line.trim())
+                if (fps > 0) {
+                    // Guardar FPS en metadatos
+                    if (!pluginApi.pluginSettings.gifsMetadata) {
+                        pluginApi.pluginSettings.gifsMetadata = {}
+                    }
+                    pluginApi.pluginSettings.gifsMetadata[targetFilename] = { fps: fps }
+                    pluginApi.saveSettings()
+                    console.log("GIF FPS detectado:", targetFilename, "→", fps)
+                }
+            }
+        }
+    }
+
     function addGifFromPath(srcPath) {
         if (srcPath === "" || (!srcPath.toLowerCase().endsWith(".gif"))) {
             ToastService.showNotice("El archivo debe ser .gif")
@@ -86,6 +113,12 @@ ColumnLayout {
         copyProc.targetFilename = filename
         copyProc.command = ["cp", srcPath, destPath]
         copyProc.running = true
+        
+        // Auto-detectar FPS del GIF
+        detectFpsProc.targetFilename = filename
+        detectFpsProc.command = ["bash", pluginApi.pluginDir + "/detect-gif-fps.sh", destPath]
+        detectFpsProc.running = true
+        
         return true
     }
 
@@ -108,6 +141,31 @@ ColumnLayout {
         }
         mkdirProc.command = ["mkdir", "-p", pluginApi.pluginDir + "/gifs"]
         mkdirProc.running = true
+        
+        // Auto-detectar FPS de GIFs existentes que no tengan metadatos
+        autoDetectExistingGifsFps()
+    }
+    
+    function autoDetectExistingGifsFps() {
+        // Esperar a que gifFolderModel cargue
+        Qt.callLater(function() {
+            for (var i = 0; i < root.folderFiles.length; i++) {
+                var filename = root.folderFiles[i]
+                
+                // Si ya tiene metadatos, saltar
+                if (pluginApi.pluginSettings.gifsMetadata[filename]) {
+                    continue
+                }
+                
+                // Detectar FPS
+                var gifPath = root.gifsFolder + "/" + filename
+                detectFpsProc.targetFilename = filename
+                detectFpsProc.command = ["bash", pluginApi.pluginDir + "/detect-gif-fps.sh", gifPath]
+                detectFpsProc.running = true
+                
+                console.log("Auto-detectando FPS de:", filename)
+            }
+        })
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -300,7 +358,16 @@ ColumnLayout {
                 text: "Abrir carpeta"
                 Layout.alignment: Qt.AlignHCenter
                 onClicked: {
-                    Qt.openUrlExternally("file://" + root.gifsFolder)
+                    // Usar dolphin directamente (xdg-open abre kitty en este sistema)
+                    // Fallback: gio open, thunar, nautilus
+                    openFolderProc.command = ["bash", "-c",
+                        'dolphin "' + root.gifsFolder + '" 2>/dev/null || ' +
+                        'gio open "' + root.gifsFolder + '" 2>/dev/null || ' +
+                        'nautilus "' + root.gifsFolder + '" 2>/dev/null || ' +
+                        'thunar "' + root.gifsFolder + '" 2>/dev/null || ' +
+                        'nemo "' + root.gifsFolder + '" 2>/dev/null'
+                    ]
+                    openFolderProc.running = true
                 }
             }
         }

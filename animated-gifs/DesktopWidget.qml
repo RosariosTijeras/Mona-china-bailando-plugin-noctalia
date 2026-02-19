@@ -53,9 +53,10 @@ DraggableDesktopWidget {
         return paths
     }
 
-    // GIF asignado a este widget específico (desde widgetData)
+    // GIF asignado a este widget específico (desde widgetData o JSON)
     // Cada widget puede tener un GIF diferente configurado independientemente
     property string _assignedGifFilename: ""
+    property bool _configLoaded: false  // Flag para saber si ya cargó la config
     
     // Proceso para cargar configuración del archivo JSON
     Process {
@@ -71,15 +72,25 @@ DraggableDesktopWidget {
                             var w = config.widgets[i]
                             if (w.index === widgetIndex && w.gifFilename) {
                                 _assignedGifFilename = w.gifFilename
-                                console.log("GIF Widget [" + widgetIndex + "]: Configuración cargada desde archivo →", w.gifFilename)
-                                break
+                                console.log("GIF Widget [" + widgetIndex + "]: ✓ Config cargada desde JSON →", w.gifFilename)
+                                _configLoaded = true
+                                return
                             }
                         }
+                        // No hay config para este widget en el JSON, usar widgetData
+                        console.log("GIF Widget [" + widgetIndex + "]: Sin config en JSON para este widget")
                     }
                 } catch(e) {
-                    console.log("GIF Widget: Error parseando config:", e)
+                    console.log("GIF Widget [" + widgetIndex + "]: Error parseando config:", e)
                 }
+                _configLoaded = true
             }
+        }
+        onExited: function(code) {
+            if (code !== 0) {
+                console.log("GIF Widget [" + widgetIndex + "]: No se pudo leer widgets-config.json (code", code, "), usando widgetData")
+            }
+            _configLoaded = true
         }
     }
     
@@ -108,32 +119,54 @@ DraggableDesktopWidget {
         }
     }
     
-    // Inicializar desde widgetData
+    // Inicializar widget
     Component.onCompleted: {
-        // Intentar cargar desde archivo JSON (más confiable que widgetData)
+        // Preparar widgetData
+        if (!widgetData) {
+            widgetData = {}
+        }
+        
+        // Intentar cargar desde JSON primero
         var configPath = pluginApi?.pluginDir + "/widgets-config.json"
         if (configPath && pluginApi?.pluginDir) {
             loadConfigProc.command = ["cat", configPath]
             loadConfigProc.running = true
+            
+            // Timeout: si no carga en 300ms, usar widgetData
+            configLoadTimeoutTimer.start()
+        } else {
+            // No hay ruta de config, usar widgetData inmediatamente
+            var fromWidgetData = widgetData?.gifFilename ?? ""
+            if (fromWidgetData) {
+                _assignedGifFilename = fromWidgetData
+                console.log("GIF Widget [" + widgetIndex + "]: Sin ruta de config, usando widgetData →", fromWidgetData)
+            }
+            _configLoaded = true
         }
         
-        // Fallback: intentar desde widgetData
-        if (!widgetData) {
-            widgetData = {}
-        }
-        var fromWidgetData = widgetData?.gifFilename ?? ""
-        if (fromWidgetData && !_assignedGifFilename) {
-            _assignedGifFilename = fromWidgetData
-        }
+        console.log("GIF Widget [" + widgetIndex + "]: Inicializado")
         
-        // Log de inicio
-        console.log("GIF Widget [" + widgetIndex + "]: Inicializando...",
-                    "| GIF asignado:", _assignedGifFilename || "(ninguno)")
-        
-        // Si ya hay música reproduciéndose, iniciar detección de BPM
-        if (isMusicPlaying && widgetIndex === 0) {
-            console.log("GIF Widget: Música detectada al iniciar, lanzando análisis BPM...")
-            bpmDelayTimer.restart()
+        // Iniciar detección BPM en tiempo real (solo widget #0)
+        if (widgetIndex === 0) {
+            startBpmRealtime()
+        }
+    }
+    
+    // Timer para fallback si la carga JSON tarda mucho
+    Timer {
+        id: configLoadTimeoutTimer
+        interval: 300
+        repeat: false
+        onTriggered: {
+            if (!_configLoaded && !_assignedGifFilename) {
+                // Timeout alcanzado, usar widgetData como fallback
+                var fromWidgetData = widgetData?.gifFilename ?? ""
+                if (fromWidgetData) {
+                    _assignedGifFilename = fromWidgetData
+                    console.log("GIF Widget [" + widgetIndex + "]: Timeout, usando widgetData →", fromWidgetData)
+                }
+                _configLoaded = true
+            }
         }
     }
     
@@ -216,33 +249,44 @@ DraggableDesktopWidget {
 
     readonly property real gifBaseFPS: {
         try {
-            // Intentar obtener FPS específico del GIF actual
+            // Intentar obtener FPS específico del GIF actual desde metadatos
             if (currentGif && pluginApi?.pluginSettings?.gifsMetadata) {
-                var metadata = pluginApi.pluginSettings.gifsMetadata[currentGif.filename]
+                var filename = currentGif.filename || (_assignedGifFilename || "")
+                var metadata = pluginApi.pluginSettings.gifsMetadata[filename]
                 if (metadata && metadata.fps > 0) {
+                    console.log("GIF Widget [" + widgetIndex + "]: Usando FPS detectado →", metadata.fps, "para", filename)
                     return metadata.fps
                 }
             }
-            // Fallback: Estandarizar a 30 FPS (funciona bien para la mayoría de GIFs)
-            return 30.0
-        } catch(e) { return 30.0 }
+            // Fallback conservador: 20 FPS (el más bajo de tus GIFs)
+            return 20.0
+        } catch(e) { return 20.0 }
     }
 
+    // gifBaseBPM: BPM al que el GIF fue diseñado para ir a velocidad 1×
+    // 100 BPM = velocidad natural. Si la canción tiene 150 BPM, el GIF irá a 1.5×
     readonly property real gifBaseBPM: {
-        try { return pluginApi?.pluginSettings?.gifBPM ?? 120.0 } catch(e) { return 120.0 }
+        try { return pluginApi?.pluginSettings?.gifBPM ?? 100.0 } catch(e) { return 100.0 }
     }
 
     readonly property real manualBPM: {
         try { return pluginApi?.pluginSettings?.manualBPM ?? -1 } catch(e) { return -1 }
     }
 
-    // API key de GetSongBPM (getsongbpm.com — gratis, 500 req/día)
-    // readonly property string bpmApiKey — REMOVIDO: ya no se usan APIs externas
+    // ── BPM detectado en tiempo real via bpm-realtime.py ─────────────────
+    // El script Python corre como proceso persistente, captura audio del
+    // sistema via PipeWire/PulseAudio + aubio.tempo y emite "BPM:XXX.X"
+    // por stdout en cada beat detectado. Funciona con CUALQUIER fuente:
+    // Spotify, YouTube, VLC, Firefox, etc.
+    property real realtimeBPM: -1   // BPM del proceso Python en tiempo real
+    property real detectedBPM: -1   // BPM de playerctl (fallback)
+    property bool _bpmProcessReady: false  // Script listo para detectar
 
-    // BPM detectado localmente via PipeWire + aubio (detect-bpm.sh)
-    property real apiBPM: -1
-    // BPM recibido de playerctl --follow (cualquier app del escritorio)
-    property real detectedBPM: -1
+    // Sistema de interpolación suave de BPM
+    property real _currentBPM: 100.0  // BPM actual interpolado (ritmo medio)
+    property real _targetBPM: 100.0   // BPM objetivo al que interpolar
+    property real _previousBPM: 100.0 // BPM anterior para transición
+    property real _transitionProgress: 1.0  // 0.0 = inicio, 1.0 = completo
 
     // BPM desde metadatos MPRIS (raro pero posible)
     readonly property real mprisBPM: {
@@ -255,37 +299,31 @@ DraggableDesktopWidget {
         } catch(e) { return -1 }
     }
 
-    // BPM efectivo: MPRIS → detección local → playerctl → manual → -1
+    // BPM efectivo: MPRIS → tiempo real → playerctl → manual → BPM interpolado
     readonly property real effectiveBPM: {
-        if (mprisBPM    > 0) return mprisBPM
-        if (apiBPM      > 0) return apiBPM
-        if (detectedBPM > 0) return detectedBPM
-        if (manualBPM   > 0) return manualBPM
-        return -1
+        if (mprisBPM     > 0) return mprisBPM
+        if (realtimeBPM  > 0) return _currentBPM   // BPM interpolado suavemente
+        if (detectedBPM  > 0) return detectedBPM
+        if (manualBPM    > 0) return manualBPM
+        return _currentBPM  // Ritmo medio si no hay detección
     }
 
     // Cuando cambia el BPM efectivo, ajustar velocidad del GIF
     onEffectiveBPMChanged: {
-        console.log("GIF Widget [" + widgetIndex + "]: BPM cambió →", effectiveBPM,
-                    "| gifBaseBPM:", gifBaseBPM,
-                    "| rate:", playbackRate.toFixed(2) + "×",
-                    "| interval:", frameInterval + "ms")
         if (effectiveBPM > 0 && isMusicPlaying && gifReady) {
             frameTicker.restart()
         }
     }
 
     // playbackRate: qué tan rápido va el GIF respecto a su velocidad nativa
-    // Formula directa como spicetify-cat-jam-synced: trackBPM / videoDefaultBPM
-    // IMPORTANTE: Limitado entre 0.5× y 1.5× para evitar velocidades extremas
+    // Formula: trackBPM / gifBaseBPM. Si canción=150 y base=100, rate=1.5×
+    // Rango: 0.4× (canción lenta) a 2.0× (canción rápida)
     readonly property real playbackRate: {
         if (effectiveBPM > 0) {
             var rate = effectiveBPM / gifBaseBPM
-            // Limitar a rango razonable para evitar que se rompa
-            return Math.max(0.5, Math.min(rate, 1.5))
+            return Math.max(0.4, Math.min(rate, 2.0))
         }
-        // Si no hay BPM detectado, ir a velocidad reducida (0.5×)
-        return 0.5
+        return 1.0
     }
 
     // Intervalo del timer de frames
@@ -296,9 +334,7 @@ DraggableDesktopWidget {
         id: frameTicker
         interval: root.frameInterval
         repeat: true
-        // Permite animar incluso sin BPM detectado (con velocidad reducida)
         running: root.gifReady && root.isMusicPlaying
-
         onTriggered: {
             if (gifDisplay.frameCount > 0)
                 gifDisplay.currentFrame = (gifDisplay.currentFrame + 1) % gifDisplay.frameCount
@@ -306,181 +342,116 @@ DraggableDesktopWidget {
         onIntervalChanged: { if (running) restart() }
     }
 
-    // ── Detección local de BPM via PipeWire + aubio ─────────────────────
-    // Captura el audio del sistema (lo que suena) y analiza el BPM.
-    // Funciona con CUALQUIER fuente: Spotify, YouTube, VLC, Firefox, etc.
-    // No requiere APIs, claves ni internet.
-    property string _bpmDetectBuffer: ""
-    property bool _bpmDetecting: false
-    // Nombre de la última canción analizada (evita re-analizar la misma)
-    property string _lastAnalyzedTrack: ""
-    // Timestamp de cuándo se lanzó la detección (para invalidar resultados viejos)
-    property real _bpmDetectStartTime: 0
-    // BPM anterior para suavizado de transiciones
-    property real _previousApiBPM: -1
-
     // ── Estado de reproducción de música ──────────────────────────────────
-    // Usa SOLO MediaService.isPlaying (reproductores MPRIS dedicados: Spotify, VLC, etc.)
-    // NO detecta audio del navegador/juegos (evita falsos positivos)
     readonly property bool isMusicPlaying: MediaService.isPlaying
 
-    // Cuando cambia el estado de reproducción
     onIsMusicPlayingChanged: {
         console.log("GIF Widget [" + widgetIndex + "]: isMusicPlaying →", isMusicPlaying,
                     "| Player:", MediaService.currentPlayer?.playerName ?? "none")
         if (isMusicPlaying) {
-            // Empezó la música → animar GIF y detectar BPM
             frameTicker.restart()
-            if (effectiveBPM <= 0) {
-                // No hay BPM detectado → iniciar detección
-                bpmDelayTimer.restart()
-            }
         } else {
-            // Se detuvo la música → pausar inmediatamente
             console.log("GIF Widget [" + widgetIndex + "]: Música pausada")
             frameTicker.stop()
         }
     }
 
-    // Ruta al script de detección
-    readonly property string detectBpmScript: {
+    // ══════════════════════════════════════════════════════════════════════
+    // DETECCIÓN BPM EN TIEMPO REAL — Proceso Python persistente
+    // ══════════════════════════════════════════════════════════════════════
+    // bpm-realtime.py corre continuamente, captura audio del sistema y
+    // emite líneas "BPM:XXX.X" por stdout en cada beat. No necesita
+    // grabar archivos WAV ni lanzar procesos periódicos.
+
+    readonly property string bpmRealtimeScript: {
         try {
             if (!pluginApi || !pluginApi.pluginDir) return ""
-            return pluginApi.pluginDir + "/detect-bpm.sh"
+            return pluginApi.pluginDir + "/bpm-realtime.py"
         } catch(e) { return "" }
     }
 
-    // Duración de captura en segundos (configurable en settings, default 5s para respuesta rápida)
-    readonly property int bpmCaptureSecs: {
-        try { return pluginApi?.pluginSettings?.bpmCaptureSecs ?? 5 } catch(e) { return 5 }
-    }
-
     Process {
-        id: bpmDetectProc
+        id: bpmRealtimeProc
         running: false
         stdout: SplitParser {
             onRead: function(line) {
-                root._bpmDetectBuffer += line.trim()
+                var trimmed = line.trim()
+
+                // Parsear mensajes del script
+                if (trimmed.startsWith("BPM:")) {
+                    var bpmStr = trimmed.substring(4)
+                    var bpm = parseFloat(bpmStr)
+                    if (bpm > 0 && bpm < 300) {
+                        // Iniciar transición suave al nuevo BPM
+                        root._previousBPM = root._currentBPM
+                        root._targetBPM = bpm
+                        root._transitionProgress = 0.0
+                        root.realtimeBPM = bpm
+                    }
+                } else if (trimmed === "READY") {
+                    root._bpmProcessReady = true
+                    console.log("GIF Widget [" + widgetIndex + "]: ✓ BPM realtime → LISTO")
+                } else if (trimmed.startsWith("DEVICE:")) {
+                    console.log("GIF Widget [" + widgetIndex + "]: Audio device →", trimmed.substring(7))
+                } else if (trimmed.startsWith("ERROR:")) {
+                    console.log("GIF Widget [" + widgetIndex + "]: BPM error →", trimmed)
+                }
             }
         }
         onExited: function(code) {
-            var startedAt = root._bpmDetectStartTime
-            root._bpmDetecting = false
-
-            if (code !== 0 || root._bpmDetectBuffer === "") {
-                root._bpmDetectBuffer = ""
-                console.log("GIF Widget: detect-bpm.sh no obtuvo BPM (¿no hay audio?)")
-                return
-            }
-
-            // Si la canción cambió mientras se analizaba, descartar resultado
-            var currentTrack = (MediaService.trackTitle ?? "") + "|" + (MediaService.trackArtist ?? "")
-            if (currentTrack !== root._lastAnalyzedTrack) {
-                root._bpmDetectBuffer = ""
-                console.log("GIF Widget: Canción cambió durante análisis, descartando resultado")
-                root.fetchBpmFromAudio(false)
-                return
-            }
-
-            try {
-                var bpm = parseFloat(root._bpmDetectBuffer)
-                root._bpmDetectBuffer = ""
-                if (bpm > 0 && bpm < 300) {
-                    // Si el BPM cambió dramáticamente (>30%), resetear suavizado
-                    var smoothed = bpm
-                    if (root._previousApiBPM > 0) {
-                        var change = Math.abs(bpm - root._previousApiBPM) / root._previousApiBPM
-                        if (change > 0.3) {
-                            // Cambio grande → resetear suavizado
-                            console.log("GIF Widget: BPM cambió mucho (" + (change * 100).toFixed(0) + "%), reseteando suavizado")
-                            smoothed = bpm
-                        } else {
-                            // Cambio pequeño → suavizar transición
-                            smoothed = Math.round((0.65 * bpm + 0.35 * root._previousApiBPM) * 10) / 10
-                        }
-                    }
-                    root._previousApiBPM = bpm
-                    root.apiBPM = smoothed
-                    console.log("GIF Widget: BPM detectado:", bpm, "→ suavizado:", smoothed,
-                                "| gifBaseBPM:", root.gifBaseBPM,
-                                "| playbackRate calculado:", (smoothed / root.gifBaseBPM).toFixed(2) + "×",
-                                "| limitado a:", root.playbackRate.toFixed(2) + "×")
-                    // El frameTicker ya está corriendo, solo ajustar velocidad
-                } else {
-                    console.log("GIF Widget: BPM fuera de rango:", bpm)
-                }
-            } catch(e) {
-                root._bpmDetectBuffer = ""
-                console.log("GIF Widget: Error parseando BPM:", e)
+            console.log("GIF Widget [" + widgetIndex + "]: bpm-realtime.py terminó (code", code, ")")
+            root._bpmProcessReady = false
+            // Auto-reiniciar si se cayó inesperadamente y sigue reproduciéndose música
+            if (root.isMusicPlaying && code !== 0) {
+                bpmRestartTimer.start()
             }
         }
     }
 
-    function fetchBpmFromAudio(isRefresh) {
-        if (root.detectBpmScript === "") return
+    // Timer para reiniciar el proceso Python si se cae
+    Timer {
+        id: bpmRestartTimer
+        interval: 3000
+        repeat: false
+        onTriggered: {
+            if (root.isMusicPlaying && !bpmRealtimeProc.running) {
+                console.log("GIF Widget [" + widgetIndex + "]: Reiniciando bpm-realtime.py...")
+                root.startBpmRealtime()
+            }
+        }
+    }
+
+    function startBpmRealtime() {
+        if (bpmRealtimeScript === "") return
         // Solo el widget #0 lanza la detección (evita múltiples procesos)
         if (typeof widgetIndex !== "undefined" && widgetIndex !== 0) return
+        if (bpmRealtimeProc.running) return
 
-        // Si ya está corriendo, no lanzar otro
-        if (root._bpmDetecting) return
-
-        // Solo analizar si hay música reproduciéndose
-        if (!root.isMusicPlaying) return
-
-        // Construir clave de canción
-        var trackKey = (MediaService.trackTitle ?? "") + "|" + (MediaService.trackArtist ?? "")
-
-        // En modo normal: evitar re-analizar la misma canción si ya tenemos BPM
-        // En modo refresh: siempre re-analizar para captar cambios de ritmo
-        if (!isRefresh && trackKey === root._lastAnalyzedTrack && root.apiBPM > 0) return
-        root._lastAnalyzedTrack = trackKey
-
-        // Captura más corta en modo refresh para respuesta rápida
-        var captureSecs = isRefresh
-            ? Math.max(3, Math.floor(root.bpmCaptureSecs * 0.6))
-            : root.bpmCaptureSecs
-
-        root._bpmDetectBuffer = ""
-        root._bpmDetecting = true
-        root._bpmDetectStartTime = Date.now()
-        bpmDetectProc.command = ["bash", root.detectBpmScript, captureSecs.toString()]
-        bpmDetectProc.running = false
-        bpmDetectProc.running = true
-        console.log("GIF Widget: Analizando audio (" + captureSecs + "s" + (isRefresh ? ", refresh" : "") + ")...")
+        console.log("GIF Widget [" + widgetIndex + "]: Iniciando bpm-realtime.py")
+        bpmRealtimeProc.command = ["python3", bpmRealtimeScript]
+        bpmRealtimeProc.running = true
     }
 
-    // Re-analizar periódicamente si no se tiene BPM (solo cuando hay música)
-    Timer {
-        id: bpmRetryTimer
-        interval: 15000  // reintentar cada 15s si no hay BPM
-        repeat: true
-        running: root.effectiveBPM <= 0 && root.isMusicPlaying
-        onTriggered: {
-            if (!root._bpmDetecting) {
-                root._lastAnalyzedTrack = ""
-                root.fetchBpmFromAudio(false)
-            }
+    function stopBpmRealtime() {
+        if (bpmRealtimeProc.running) {
+            console.log("GIF Widget [" + widgetIndex + "]: Deteniendo bpm-realtime.py")
+            bpmRealtimeProc.running = false
         }
     }
 
-    // ── Actualización periódica de BPM mientras suena música ─────────────
-    // Re-captura el BPM cada cierto tiempo para seguir cambios de ritmo
-    // dentro de la misma canción (drops, breakdowns, cambios de tempo)
+    // ── Interpolación suave entre BPMs (transición gradual) ───────────────────
     Timer {
-        id: bpmRefreshTimer
-        interval: 20000  // re-analizar cada 20s para seguir cambios de ritmo
+        id: bpmTransitionTimer
+        interval: 33  // ~30 FPS de interpolación
         repeat: true
-        running: root.isMusicPlaying && root.effectiveBPM > 0
+        running: root._transitionProgress < 1.0 && root.isMusicPlaying
         onTriggered: {
-            if (!root._bpmDetecting) {
-                console.log("GIF Widget: Refrescando BPM en tiempo real...")
-                root.fetchBpmFromAudio(true)  // true = refresh (captura corta)
-            }
+            root._transitionProgress = Math.min(1.0, root._transitionProgress + 0.05)
+            root._currentBPM = root._previousBPM + (root._targetBPM - root._previousBPM) * root._transitionProgress
         }
     }
 
-    // ── playerctl --follow: escucha cambios de pista en CUALQUIER app ─────
-    // Se recupera automáticamente si playerctl no está instalado o falla
+    // ── playerctl --follow: escucha cambios de pista (fallback) ───────────
     property bool _playerctlAvailable: true
 
     Process {
@@ -497,10 +468,7 @@ DraggableDesktopWidget {
                     root.detectedBPM = bpm
                 } else {
                     root.detectedBPM = -1
-                    // Canción nueva sin BPM en playerctl → analizar audio
-                    if (root.isMusicPlaying) root.fetchBpmFromAudio(false)
                 }
-                // Canción nueva → resetear frame y arrancar animación
                 if (gifDisplay.frameCount > 0) gifDisplay.currentFrame = 0
                 frameTicker.restart()
             }
@@ -508,7 +476,7 @@ DraggableDesktopWidget {
         onExited: function(code) {
             if (code !== 0) {
                 root._playerctlAvailable = false
-                console.log("GIF Widget: playerctl no disponible (code " + code + "), usando solo detección de audio")
+                console.log("GIF Widget: playerctl no disponible (code " + code + ")")
             }
         }
     }
@@ -520,7 +488,6 @@ DraggableDesktopWidget {
             console.log("GIF Widget [" + widgetIndex + "]: Cambio de reproductor →",
                         MediaService.currentPlayer?.playerName ?? "none")
             root.detectedBPM = -1
-            root._previousApiBPM = -1
             if (gifDisplay.frameCount > 0) gifDisplay.currentFrame = 0
             if (root.isMusicPlaying) {
                 frameTicker.restart()
@@ -528,16 +495,15 @@ DraggableDesktopWidget {
         }
         function onIsPlayingChanged() {
             if (MediaService.isPlaying) {
-                // Música reanudada → arrancar animación
                 console.log("GIF Widget [" + widgetIndex + "]: Reproducción iniciada")
                 if (gifDisplay.frameCount > 0) gifDisplay.currentFrame = 0
                 frameTicker.restart()
-                // Si no hay BPM, lanzar detección
-                if (root.effectiveBPM <= 0) root.fetchBpmFromAudio(false)
+                // Iniciar detección BPM en tiempo real
+                root.startBpmRealtime()
             } else {
-                // Música pausada → congelar GIF inmediatamente
                 console.log("GIF Widget [" + widgetIndex + "]: Reproducción pausada")
                 frameTicker.stop()
+                // No detener el proceso Python — es ligero y se recupera solo
             }
         }
         function onTrackTitleChanged() {
@@ -545,23 +511,13 @@ DraggableDesktopWidget {
                         MediaService.trackTitle ?? "unknown",
                         "|", MediaService.trackArtist ?? "unknown")
             root.detectedBPM = -1
-            root.apiBPM = -1
-            root._previousApiBPM = -1
-            root._lastAnalyzedTrack = ""
-            // Canción nueva → analizar audio del sistema
-            // Esperar 3s para que la nueva canción empiece a sonar
-            bpmDelayTimer.restart()
+            // Resetear a ritmo medio al cambiar canción
+            root._currentBPM = 100.0
+            root._targetBPM = 100.0
+            root._previousBPM = 100.0
+            root._transitionProgress = 1.0
+            // El proceso Python detectará el nuevo BPM automáticamente en ~1-2s
         }
-    }
-
-    // Timer para retrasar el análisis cuando cambia la canción
-    // Espera a que la nueva canción empiece a sonar antes de capturar audio
-    Timer {
-        id: bpmDelayTimer
-        interval: 3000  // 3 segundos de espera
-        repeat: false
-        running: false
-        onTriggered: root.fetchBpmFromAudio(false)
     }
 
     // ══════════════════════════════════════════════════════════════════════
