@@ -22,7 +22,7 @@ ColumnLayout {
         } catch(e) { return "" }
     }
 
-    // Escanea la carpeta gifs/ en tiempo real
+    // Recarga sola cuando cambia algo en la carpeta
     FolderListModel {
         id: gifFolderModel
         folder: root.gifsFolder ? ("file://" + root.gifsFolder) : ""
@@ -33,7 +33,7 @@ ColumnLayout {
         sortField: FolderListModel.Name
     }
 
-    // Lista de nombres de archivo en la carpeta
+    // Solo los nombres, no las rutas completas
     property var folderFiles: {
         var files = []
         for (var i = 0; i < gifFolderModel.count; i++) {
@@ -44,7 +44,7 @@ ColumnLayout {
     }
 
     function deleteGif(filename) {
-        // Borrar archivo
+        // Borra el archivo y avisa al usuario
         deleteProc.command = ["rm", "-f", gifsFolder + "/" + filename]
         deleteProc.running = true
         ToastService.showNotice(filename + " eliminado")
@@ -60,45 +60,25 @@ ColumnLayout {
         running: false
     }
 
-    // Proceso para copiar archivos desde el selector
+    // Copia el GIF a la carpeta. La detección de metadatos la hace DesktopWidget
+    // automáticamente al detectar el archivo nuevo via FolderListModel.onCountChanged
     Process {
         id: copyProc
         property string targetFilename: ""
         running: false
         onExited: function(code) {
             if (code === 0) {
-                ToastService.showNotice("GIF agregado: " + targetFilename)
+                ToastService.showNotice("GIF agregado: " + targetFilename + " — detectando metadatos...")
             } else {
                 ToastService.showNotice("Error al copiar archivo")
             }
         }
     }
 
-    // Proceso para abrir explorador de archivos
+    // Para abrir dolphin
     Process {
         id: openFolderProc
         running: false
-    }
-
-    // Proceso para detectar FPS del GIF
-    Process {
-        id: detectFpsProc
-        property string targetFilename: ""
-        running: false
-        stdout: SplitParser {
-            onRead: function(line) {
-                var fps = parseFloat(line.trim())
-                if (fps > 0) {
-                    // Guardar FPS en metadatos
-                    if (!pluginApi.pluginSettings.gifsMetadata) {
-                        pluginApi.pluginSettings.gifsMetadata = {}
-                    }
-                    pluginApi.pluginSettings.gifsMetadata[targetFilename] = { fps: fps }
-                    pluginApi.saveSettings()
-                    console.log("GIF FPS detectado:", targetFilename, "→", fps)
-                }
-            }
-        }
     }
 
     function addGifFromPath(srcPath) {
@@ -106,23 +86,19 @@ ColumnLayout {
             ToastService.showNotice("El archivo debe ser .gif")
             return false
         }
-        
+
         var filename = srcPath.split("/").pop()
         var destPath = root.gifsFolder + "/" + filename
-        
+
         copyProc.targetFilename = filename
         copyProc.command = ["cp", srcPath, destPath]
         copyProc.running = true
-        
-        // Auto-detectar FPS del GIF
-        detectFpsProc.targetFilename = filename
-        detectFpsProc.command = ["bash", pluginApi.pluginDir + "/detect-gif-fps.sh", destPath]
-        detectFpsProc.running = true
-        
+        // DesktopWidget detectará el GIF nuevo via onCountChanged y detectará sus metadatos
         return true
     }
 
     Component.onCompleted: {
+        // Valores por defecto si no están ya guardados
         if (!pluginApi.pluginSettings.gifFPS) {
             pluginApi.pluginSettings.gifFPS = 33.33
         }
@@ -135,41 +111,16 @@ ColumnLayout {
         if (pluginApi.pluginSettings.bpmCaptureSecs === undefined) {
             pluginApi.pluginSettings.bpmCaptureSecs = 5
         }
-        // Inicializar objeto de metadatos de GIFs si no existe
         if (!pluginApi.pluginSettings.gifsMetadata) {
             pluginApi.pluginSettings.gifsMetadata = {}
         }
+        // Creo la carpeta gifs/ si no existe
         mkdirProc.command = ["mkdir", "-p", pluginApi.pluginDir + "/gifs"]
         mkdirProc.running = true
-        
-        // Auto-detectar FPS de GIFs existentes que no tengan metadatos
-        autoDetectExistingGifsFps()
-    }
-    
-    function autoDetectExistingGifsFps() {
-        // Esperar a que gifFolderModel cargue
-        Qt.callLater(function() {
-            for (var i = 0; i < root.folderFiles.length; i++) {
-                var filename = root.folderFiles[i]
-                
-                // Si ya tiene metadatos, saltar
-                if (pluginApi.pluginSettings.gifsMetadata[filename]) {
-                    continue
-                }
-                
-                // Detectar FPS
-                var gifPath = root.gifsFolder + "/" + filename
-                detectFpsProc.targetFilename = filename
-                detectFpsProc.command = ["bash", pluginApi.pluginDir + "/detect-gif-fps.sh", gifPath]
-                detectFpsProc.running = true
-                
-                console.log("Auto-detectando FPS de:", filename)
-            }
-        })
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // UI
+    // Interfaz
     // ══════════════════════════════════════════════════════════════════════
 
     NText {
@@ -358,8 +309,8 @@ ColumnLayout {
                 text: "Abrir carpeta"
                 Layout.alignment: Qt.AlignHCenter
                 onClicked: {
-                    // Usar dolphin directamente (xdg-open abre kitty en este sistema)
-                    // Fallback: gio open, thunar, nautilus
+                    // Uso dolphin directamente porque xdg-open abre kitty en este sistema
+                    // Si no está dolphin, prueba con gio open, nautilus, thunar o nemo
                     openFolderProc.command = ["bash", "-c",
                         'dolphin "' + root.gifsFolder + '" 2>/dev/null || ' +
                         'gio open "' + root.gifsFolder + '" 2>/dev/null || ' +

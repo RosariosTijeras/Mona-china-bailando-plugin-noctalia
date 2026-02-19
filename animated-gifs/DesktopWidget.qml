@@ -12,18 +12,18 @@ import qs.Services.Media
 DraggableDesktopWidget {
     id: root
 
-    // Injected by Noctalia
+    // Lo inyecta Noctalia al montar el widget
     property var pluginApi: null
 
-    // Default size - user can resize
+    // Tamaño por defecto, el usuario puede redimensionar
     implicitWidth: Math.round(300 * widgetScale)
     implicitHeight: Math.round(300 * widgetScale)
 
-    // No background
+    // Sin fondo
     showBackground: false
 
     // ── Carpeta de GIFs ────────────────────────────────────────────────────
-    // Ruta de la carpeta donde se guardan los GIFs descargados
+    // Ruta donde están los GIFs descargados
     readonly property string gifsFolder: {
         try {
             if (!pluginApi || !pluginApi.pluginDir) return ""
@@ -31,8 +31,7 @@ DraggableDesktopWidget {
         } catch(e) { return "" }
     }
 
-    // FolderListModel: escanea la carpeta en tiempo real.
-    // Cualquier .gif que esté ahí aparece automáticamente como candidato.
+    // Escanea la carpeta en tiempo real — cualquier .gif que aparezca se carga solo
     FolderListModel {
         id: gifFolderModel
         folder: root.gifsFolder ? ("file://" + root.gifsFolder) : ""
@@ -41,9 +40,96 @@ DraggableDesktopWidget {
         showDotAndDotDot: false
         showHidden: false
         sortField: FolderListModel.Name
+
+        // Cada vez que aparece un archivo nuevo en la carpeta (independientemente
+        // de si el panel de configuración está abierto o no), lo procesamos.
+        // Solo el widget #0 lo hace para no lanzar el script varias veces.
+        onCountChanged: {
+            if (widgetIndex === 0 && root.pluginApi) {
+                root.queueMissingMetadataDetection()
+            }
+        }
     }
 
-    // Lista de rutas absolutas de todos los GIFs en la carpeta
+    // Cola de GIFs pendientes de detectar metadatos
+    property var _detectQueue: []
+    property bool _detecting: false
+
+    // Proceso que detecta fps/frames/duration de un GIF concreto
+    Process {
+        id: autoDetectProc
+        running: false
+        property string targetFilename: ""
+        stdout: SplitParser {
+            onRead: function(line) {
+                var parts = line.trim().split("|")
+                var fps      = parseFloat(parts[0])
+                var frames   = parts.length > 1 ? parseInt(parts[1])   : 0
+                var duration = parts.length > 2 ? parseFloat(parts[2]) : 0
+                if (fps > 0) {
+                    try {
+                        if (!pluginApi.pluginSettings.gifsMetadata)
+                            pluginApi.pluginSettings.gifsMetadata = {}
+                        pluginApi.pluginSettings.gifsMetadata[autoDetectProc.targetFilename] = {
+                            fps:      fps,
+                            frames:   frames   > 0 ? frames   : undefined,
+                            duration: duration > 0 ? duration : undefined
+                        }
+                        pluginApi.saveSettings()
+                        console.log("GIF Widget: metadatos guardados →",
+                            autoDetectProc.targetFilename,
+                            fps.toFixed(2) + " FPS",
+                            frames > 0   ? "· " + frames + " frames" : "",
+                            duration > 0 ? "· " + duration.toFixed(2) + "s" : "")
+                    } catch(e) {}
+                }
+            }
+        }
+        onExited: function() {
+            root._detecting = false
+            // Procesar el siguiente de la cola si hay
+            root.processDetectQueue()
+        }
+    }
+
+    // Encola todos los GIFs sin metadatos y arranca la cola
+    function queueMissingMetadataDetection() {
+        Qt.callLater(function() {
+            if (!pluginApi || !pluginApi.pluginSettings) return
+            var metadata = pluginApi.pluginSettings.gifsMetadata || {}
+            for (var i = 0; i < gifFolderModel.count; i++) {
+                var fp = gifFolderModel.get(i, "filePath")
+                if (!fp) continue
+                var filename = fp.split("/").pop()
+                // Solo encolar si no tiene metadatos y no está ya en la cola
+                if (!metadata[filename] && _detectQueue.indexOf(filename) === -1) {
+                    var queue = _detectQueue.slice()
+                    queue.push(filename)
+                    _detectQueue = queue
+                    console.log("GIF Widget: encolado para detectar →", filename)
+                }
+            }
+            processDetectQueue()
+        })
+    }
+
+    // Saca el siguiente de la cola y lanza la detección
+    function processDetectQueue() {
+        if (_detecting || _detectQueue.length === 0) return
+        var queue = _detectQueue.slice()
+        var filename = queue.shift()
+        _detectQueue = queue
+        _detecting = true
+
+        var scriptPath = pluginApi?.pluginDir + "/detect-gif-fps.sh"
+        var gifPath    = pluginApi?.pluginDir + "/gifs/" + filename
+        autoDetectProc.targetFilename = filename
+        autoDetectProc.command = ["bash", scriptPath, gifPath]
+        autoDetectProc.running = true
+        console.log("GIF Widget: detectando metadatos de →", filename)
+    }
+
+    // Rutas absolutas de todos los GIFs que hay en la carpeta
     property var folderGifPaths: {
         var paths = []
         for (var i = 0; i < gifFolderModel.count; i++) {
@@ -53,12 +139,12 @@ DraggableDesktopWidget {
         return paths
     }
 
-    // GIF asignado a este widget específico (desde widgetData o JSON)
-    // Cada widget puede tener un GIF diferente configurado independientemente
+    // El GIF que le toca a este widget (viene de widgetData o del JSON)
+    // Cada widget tiene el suyo, se pueden poner GIFs distintos en cada uno
     property string _assignedGifFilename: ""
-    property bool _configLoaded: false  // Flag para saber si ya cargó la config
+    property bool _configLoaded: false  // Para saber si ya terminó de leer la config
     
-    // Proceso para cargar configuración del archivo JSON
+    // Carga el archivo JSON con la config guardada de los widgets
     Process {
         id: loadConfigProc
         running: false
@@ -67,7 +153,7 @@ DraggableDesktopWidget {
                 try {
                     var config = JSON.parse(line)
                     if (config && config.widgets) {
-                        // Buscar configuración de este widget
+                        // Buscar la entrada de este widget en el JSON
                         for (var i = 0; i < config.widgets.length; i++) {
                             var w = config.widgets[i]
                             if (w.index === widgetIndex && w.gifFilename) {
@@ -77,7 +163,7 @@ DraggableDesktopWidget {
                                 return
                             }
                         }
-                        // No hay config para este widget en el JSON, usar widgetData
+                        // Este widget no tiene entrada en el JSON, tiro de widgetData
                         console.log("GIF Widget [" + widgetIndex + "]: Sin config en JSON para este widget")
                     }
                 } catch(e) {
@@ -94,7 +180,7 @@ DraggableDesktopWidget {
         }
     }
     
-    // Proceso para guardar configuración en archivo JSON
+    // Guarda el GIF asignado en el JSON de persistencia
     Process {
         id: saveConfigProc
         running: false
@@ -107,7 +193,7 @@ DraggableDesktopWidget {
         }
     }
     
-    // Watcher para sincronizar con widgetData
+    // Si widgetData cambia desde afuera, actualizo el GIF asignado
     Connections {
         target: root
         function onWidgetDataChanged() {
@@ -119,23 +205,23 @@ DraggableDesktopWidget {
         }
     }
     
-    // Inicializar widget
+    // Al arrancar, cargo la config y pongo todo en marcha
     Component.onCompleted: {
-        // Preparar widgetData
+        // Me aseguro de que widgetData sea un objeto
         if (!widgetData) {
             widgetData = {}
         }
         
-        // Intentar cargar desde JSON primero
+        // Primero intento leer del JSON (es la fuente fiable)
         var configPath = pluginApi?.pluginDir + "/widgets-config.json"
         if (configPath && pluginApi?.pluginDir) {
             loadConfigProc.command = ["cat", configPath]
             loadConfigProc.running = true
             
-            // Timeout: si no carga en 300ms, usar widgetData
+            // Si en 300ms no llegó nada, uso widgetData de todos modos
             configLoadTimeoutTimer.start()
         } else {
-            // No hay ruta de config, usar widgetData inmediatamente
+            // No tengo ruta del plugin, tiro de widgetData directamente
             var fromWidgetData = widgetData?.gifFilename ?? ""
             if (fromWidgetData) {
                 _assignedGifFilename = fromWidgetData
@@ -146,20 +232,22 @@ DraggableDesktopWidget {
         
         console.log("GIF Widget [" + widgetIndex + "]: Inicializado")
         
-        // Iniciar detección BPM en tiempo real (solo widget #0)
+        // Solo el widget 0 hace estas tareas de fondo
         if (widgetIndex === 0) {
             startBpmRealtime()
+            // Detectar metadatos de GIFs que no los tengan aún
+            queueMissingMetadataDetection()
         }
     }
     
-    // Timer para fallback si la carga JSON tarda mucho
+    // Si el JSON tarda más de 300ms, bajo a widgetData y sigo
     Timer {
         id: configLoadTimeoutTimer
         interval: 300
         repeat: false
         onTriggered: {
             if (!_configLoaded && !_assignedGifFilename) {
-                // Timeout alcanzado, usar widgetData como fallback
+                // Se acabó el tiempo, uso widgetData y listo
                 var fromWidgetData = widgetData?.gifFilename ?? ""
                 if (fromWidgetData) {
                     _assignedGifFilename = fromWidgetData
@@ -172,29 +260,28 @@ DraggableDesktopWidget {
     
     property var currentGif: {
         try {
-            // Si el widget tiene un GIF específico configurado, usarlo
+            // Si tiene un GIF configurado, verifico que el archivo siga existiendo
             if (_assignedGifFilename !== "") {
-                // Verificar que el archivo existe en la carpeta
                 for (var i = 0; i < folderGifPaths.length; i++) {
                     if (folderGifPaths[i].endsWith("/" + _assignedGifFilename)) {
                         return { filename: _assignedGifFilename, name: _assignedGifFilename.replace(/\.gif$/i, "") }
                     }
                 }
-                // El archivo asignado ya no existe
+                // Ya no está el archivo, probablemente lo borraron
                 console.log("GIF Widget: Archivo asignado no encontrado:", _assignedGifFilename)
             }
-            // Sin GIF asignado → mostrar selector en edit mode
+            // Sin GIF asignado → en modo edición aparece el selector
             return null
         } catch(e) { return null }
     }
 
-    // Función para asignar un GIF a este widget
+    // Asigna un GIF a este widget y lo guarda
     function assignGif(filename) {
         console.log("GIF Widget [" + widgetIndex + "]: assignGif() llamado con →", filename)
         
         _assignedGifFilename = filename
         
-        // Guardar en widgetData (backup)
+        // Lo meto también en widgetData por si acaso
         var newData = {}
         if (widgetData) {
             for (var key in widgetData) {
@@ -204,7 +291,7 @@ DraggableDesktopWidget {
         newData.gifFilename = filename
         widgetData = newData
         
-        // Guardar en archivo JSON (persistencia real)
+        // Y lo persisto en el JSON para que no se pierda al reiniciar
         var scriptPath = pluginApi?.pluginDir + "/save-widget-config.sh"
         if (scriptPath && pluginApi?.pluginDir) {
             saveConfigProc.command = ["bash", scriptPath, widgetIndex.toString(), filename]
@@ -214,7 +301,7 @@ DraggableDesktopWidget {
         console.log("GIF Widget [" + widgetIndex + "]: GIF asignado →", filename)
     }
 
-    // URL completa del GIF actual
+    // URL completa del GIF para pasarle al AnimatedImage
     property string gifUrl: {
         try {
             if (!currentGif) return ""
@@ -224,32 +311,31 @@ DraggableDesktopWidget {
         } catch(e) { return "" }
     }
 
-    // El GIF está listo para mostrar (también en edit mode si tiene GIF asignado)
+    // El GIF cargó bien y hay uno asignado
     property bool gifReady: gifDisplay.status === AnimatedImage.Ready && currentGif !== null
 
-    // ¿Hay GIFs disponibles pero ninguno asignado a este widget?
+    // Hay GIFs en la carpeta pero este widget no tiene ninguno asignado
     property bool needsGifSelection: folderGifPaths.length > 0 && currentGif === null
 
-    // Scaled values
+    // Valores escalados según el zoom del widget
     readonly property int scaledRadius: Math.round(Style.radiusM * widgetScale)
     readonly property int scaledMargin: Math.round(16 * widgetScale)
     readonly property int scaledIconSize: Math.round(48 * widgetScale)
 
     // ══════════════════════════════════════════════════════════════════════
-    // BPM sync — lógica cat-jam adaptada para QML
+    // Sincronización BPM
     //
-    // VELOCIDAD: frameInterval = 1000 / (gifBaseFPS * playbackRate)
-    //            playbackRate  = efectiveBPM / gifBaseBPM
+    // La velocidad del GIF depende del BPM de la canción:
+    //   frameInterval = 1000 / (gifBaseFPS * playbackRate)
+    //   playbackRate  = effectiveBPM / gifBaseBPM
     //
-    // SINCRONIZACIÓN AL BEAT (como cat-jam hace con currentTime=0):
-    //   Calculamos cuándo cae el siguiente beat a partir de
-    //   MediaService.currentPosition y el BPM efectivo, y en ese momento
-    //   reseteamos al frame 0.
+    // Igual que cat-jam: calculamos en qué momento cae el siguiente beat
+    // y reseteamos el GIF al frame 0 justo en ese momento.
     // ══════════════════════════════════════════════════════════════════════
 
     readonly property real gifBaseFPS: {
         try {
-            // Intentar obtener FPS específico del GIF actual desde metadatos
+            // Uso el FPS que detectó ffprobe para este GIF concreto
             if (currentGif && pluginApi?.pluginSettings?.gifsMetadata) {
                 var filename = currentGif.filename || (_assignedGifFilename || "")
                 var metadata = pluginApi.pluginSettings.gifsMetadata[filename]
@@ -258,13 +344,13 @@ DraggableDesktopWidget {
                     return metadata.fps
                 }
             }
-            // Fallback conservador: 20 FPS (el más bajo de tus GIFs)
+            // Si no hay metadatos, 20 FPS es un valor seguro para la mayoría de GIFs
             return 20.0
         } catch(e) { return 20.0 }
     }
 
-    // gifBaseBPM: BPM al que el GIF fue diseñado para ir a velocidad 1×
-    // 100 BPM = velocidad natural. Si la canción tiene 150 BPM, el GIF irá a 1.5×
+    // BPM al que el GIF va a velocidad 1×. Con 100 BPM en la canción —> playbackRate = 1.0
+    // Si la canción va a 150 BPM el GIF irá a 1.5×
     readonly property real gifBaseBPM: {
         try { return pluginApi?.pluginSettings?.gifBPM ?? 100.0 } catch(e) { return 100.0 }
     }
@@ -273,22 +359,51 @@ DraggableDesktopWidget {
         try { return pluginApi?.pluginSettings?.manualBPM ?? -1 } catch(e) { return -1 }
     }
 
-    // ── BPM detectado en tiempo real via bpm-realtime.py ─────────────────
-    // El script Python corre como proceso persistente, captura audio del
-    // sistema via PipeWire/PulseAudio + aubio.tempo y emite "BPM:XXX.X"
-    // por stdout en cada beat detectado. Funciona con CUALQUIER fuente:
-    // Spotify, YouTube, VLC, Firefox, etc.
-    property real realtimeBPM: -1   // BPM del proceso Python en tiempo real
-    property real detectedBPM: -1   // BPM de playerctl (fallback)
-    property bool _bpmProcessReady: false  // Script listo para detectar
+    // ── BPM en tiempo real desde bpm-realtime.py ───────────────────────────────────
+    // El script Python está corriendo en segundo plano todo el tiempo.
+    // Captura el audio del sistema (PipeWire/PulseAudio + aubio) y va
+    // mandando "BPM:XXX.X" por stdout en cada beat que detecta.
+    // Funciona con Spotify, YouTube, VLC, lo que sea.
+    property real realtimeBPM: -1   // BPM que está mandando el script ahora mismo
+    property real detectedBPM: -1   // BPM de playerctl (por si acaso)
+    property bool _bpmProcessReady: false  // El script terminó de arrancar y está escuchando
 
-    // Sistema de interpolación suave de BPM
-    property real _currentBPM: 100.0  // BPM actual interpolado (ritmo medio)
-    property real _targetBPM: 100.0   // BPM objetivo al que interpolar
-    property real _previousBPM: 100.0 // BPM anterior para transición
-    property real _transitionProgress: 1.0  // 0.0 = inicio, 1.0 = completo
+    // Interpolación suave entre BPMs para que no haya saltos bruscos
+    property real _currentBPM: 100.0  // BPM en el que estamos ahora mismo
+    property real _targetBPM: 100.0   // BPM al que queremos llegar
+    property real _previousBPM: 100.0 // El BPM anterior para interpolar desde ahí
+    property real _transitionProgress: 1.0  // 0 = acaba de empezar, 1 = ya llegó
 
-    // BPM desde metadatos MPRIS (raro pero posible)
+    // Buffer para el filtro de mediana rodante.
+    // Aubio con audio orquestal manda valores muy irregulares (e.g. 93 → 176 → 92).
+    // Guardamos las últimas 7 lecturas y usamos la mediana — los spikes desaparecen solos.
+    property var _bpmBuffer: []
+    property int _bpmBufferSize: 7
+
+    // Aplica corrección de doblado y devuelve la mediana del buffer.
+    function processBpm(rawBpm) {
+        // Corrección de doblado: aubio a veces detecta 2× el tempo real.
+        // Si el valor nuevo es ~2× el BPM suavizado actual, lo dividimos.
+        var ref = (_currentBPM > 0) ? _currentBPM : 100.0
+        if (rawBpm > ref * 1.75 && rawBpm < ref * 2.25) {
+            rawBpm = rawBpm / 2.0
+        }
+
+        // Meter en el buffer y recortarlo al tamaño máximo
+        var buf = _bpmBuffer.slice()
+        buf.push(rawBpm)
+        if (buf.length > _bpmBufferSize) buf.shift()
+        _bpmBuffer = buf
+
+        // Calcular mediana
+        var sorted = buf.slice().sort(function(a, b) { return a - b })
+        var mid = Math.floor(sorted.length / 2)
+        return (sorted.length % 2 === 0)
+            ? (sorted[mid - 1] + sorted[mid]) / 2
+            : sorted[mid]
+    }
+
+    // BPM sacado de los metadatos MPRIS (raro que esté, pero por si acaso)
     readonly property real mprisBPM: {
         try {
             var meta = MediaService.currentPlayer?.metadata
@@ -299,7 +414,7 @@ DraggableDesktopWidget {
         } catch(e) { return -1 }
     }
 
-    // BPM efectivo: MPRIS → tiempo real → playerctl → manual → BPM interpolado
+    // El BPM que se usa en realidad: MPRIS > tiempo real > playerctl > manual > por defecto
     readonly property real effectiveBPM: {
         if (mprisBPM     > 0) return mprisBPM
         if (realtimeBPM  > 0) return _currentBPM   // BPM interpolado suavemente
@@ -308,28 +423,34 @@ DraggableDesktopWidget {
         return _currentBPM  // Ritmo medio si no hay detección
     }
 
-    // Cuando cambia el BPM efectivo, ajustar velocidad del GIF
+    // Cuando cambia el BPM, reinicio el timer para que se aplique ya
     onEffectiveBPMChanged: {
         if (effectiveBPM > 0 && isMusicPlaying && gifReady) {
             frameTicker.restart()
         }
     }
 
-    // playbackRate: qué tan rápido va el GIF respecto a su velocidad nativa
-    // Formula: trackBPM / gifBaseBPM. Si canción=150 y base=100, rate=1.5×
-    // Rango: 0.4× (canción lenta) a 2.0× (canción rápida)
+    // playbackRate: qué tan rápido va el GIF respecto a su velocidad normal
+    // Ej: canción a 150 BPM con base 100 BPM —> 1.5× de velocidad
+    // Con BPM en tiempo real activo uso un rango más amplio (0.25×–2.8×) para
+    // que el usuario realmente note la diferencia entre canciones lentas y rápidas.
+    // Sin detección en tiempo real, rango conservador (0.4×–2.0×).
     readonly property real playbackRate: {
         if (effectiveBPM > 0) {
             var rate = effectiveBPM / gifBaseBPM
+            if (realtimeBPM > 0) {
+                // Rango ampliado cuando el BPM viene del script Python
+                return Math.max(0.25, Math.min(rate, 2.8))
+            }
             return Math.max(0.4, Math.min(rate, 2.0))
         }
         return 1.0
     }
 
-    // Intervalo del timer de frames
+    // Cuántos ms entre frame y frame
     readonly property int frameInterval: Math.max(8, Math.round(1000.0 / (gifBaseFPS * playbackRate)))
 
-    // ── Timer principal: avanza frames a la velocidad correcta ────────────
+    // ── El timer que avanza los frames del GIF ────────────────────────────────────
     Timer {
         id: frameTicker
         interval: root.frameInterval
@@ -357,11 +478,10 @@ DraggableDesktopWidget {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // DETECCIÓN BPM EN TIEMPO REAL — Proceso Python persistente
-    // ══════════════════════════════════════════════════════════════════════
-    // bpm-realtime.py corre continuamente, captura audio del sistema y
-    // emite líneas "BPM:XXX.X" por stdout en cada beat. No necesita
-    // grabar archivos WAV ni lanzar procesos periódicos.
+    // DETECIÓN BPM EN TIEMPO REAL
+    // ════════════════════════════════════════════════════════════════════
+    // bpm-realtime.py corre sin parar, captura el audio y manda beats por stdout.
+    // No hay archivos WAV, no hay procesos intermedios, simplemente funciona.
 
     readonly property string bpmRealtimeScript: {
         try {
@@ -382,11 +502,12 @@ DraggableDesktopWidget {
                     var bpmStr = trimmed.substring(4)
                     var bpm = parseFloat(bpmStr)
                     if (bpm > 0 && bpm < 300) {
-                        // Iniciar transición suave al nuevo BPM
+                        // Filtrar con mediana y corregir doblado antes de aplicar
+                        var smoothed = root.processBpm(bpm)
                         root._previousBPM = root._currentBPM
-                        root._targetBPM = bpm
+                        root._targetBPM = smoothed
                         root._transitionProgress = 0.0
-                        root.realtimeBPM = bpm
+                        root.realtimeBPM = smoothed
                     }
                 } else if (trimmed === "READY") {
                     root._bpmProcessReady = true
@@ -401,14 +522,14 @@ DraggableDesktopWidget {
         onExited: function(code) {
             console.log("GIF Widget [" + widgetIndex + "]: bpm-realtime.py terminó (code", code, ")")
             root._bpmProcessReady = false
-            // Auto-reiniciar si se cayó inesperadamente y sigue reproduciéndose música
+            // Si se cayó con error y sigue la música, lo reinicio en 3s
             if (root.isMusicPlaying && code !== 0) {
                 bpmRestartTimer.start()
             }
         }
     }
 
-    // Timer para reiniciar el proceso Python si se cae
+    // Si el proceso Python muere, lo levanto de nuevo después de 3s
     Timer {
         id: bpmRestartTimer
         interval: 3000
@@ -423,7 +544,7 @@ DraggableDesktopWidget {
 
     function startBpmRealtime() {
         if (bpmRealtimeScript === "") return
-        // Solo el widget #0 lanza la detección (evita múltiples procesos)
+        // Solo el widget 0 hace esto, aquí los demás no hacen nada
         if (typeof widgetIndex !== "undefined" && widgetIndex !== 0) return
         if (bpmRealtimeProc.running) return
 
@@ -439,19 +560,21 @@ DraggableDesktopWidget {
         }
     }
 
-    // ── Interpolación suave entre BPMs (transición gradual) ───────────────────
+    // ── Transición suave entre BPMs ───────────────────────────────────────────────
     Timer {
         id: bpmTransitionTimer
-        interval: 33  // ~30 FPS de interpolación
+        interval: 33  // ~30 fps de interpolación
         repeat: true
         running: root._transitionProgress < 1.0 && root.isMusicPlaying
         onTriggered: {
-            root._transitionProgress = Math.min(1.0, root._transitionProgress + 0.05)
+            // 3% por tick → ~1s para completar la transición
+            // Más lento que antes (5%) para que los saltos de aubio no sean bruscos
+            root._transitionProgress = Math.min(1.0, root._transitionProgress + 0.03)
             root._currentBPM = root._previousBPM + (root._targetBPM - root._previousBPM) * root._transitionProgress
         }
     }
 
-    // ── playerctl --follow: escucha cambios de pista (fallback) ───────────
+    // ── playerctl --follow: escucha cambios de pista, trae BPM si lo tiene ─────────────
     property bool _playerctlAvailable: true
 
     Process {
@@ -481,7 +604,7 @@ DraggableDesktopWidget {
         }
     }
 
-    // ── Reaccionar a cambios de MediaService ──────────────────────────────
+    // ── Reacciones a eventos de MediaService ───────────────────────────────────────
     Connections {
         target: MediaService
         function onCurrentPlayerChanged() {
@@ -503,7 +626,7 @@ DraggableDesktopWidget {
             } else {
                 console.log("GIF Widget [" + widgetIndex + "]: Reproducción pausada")
                 frameTicker.stop()
-                // No detener el proceso Python — es ligero y se recupera solo
+                // No paro el Python — es liviano y cuando vuelva la música ya está listo
             }
         }
         function onTrackTitleChanged() {
@@ -511,17 +634,19 @@ DraggableDesktopWidget {
                         MediaService.trackTitle ?? "unknown",
                         "|", MediaService.trackArtist ?? "unknown")
             root.detectedBPM = -1
-            // Resetear a ritmo medio al cambiar canción
+            // Vuelvo al ritmo por defecto al cambiar de canción
             root._currentBPM = 100.0
             root._targetBPM = 100.0
             root._previousBPM = 100.0
             root._transitionProgress = 1.0
-            // El proceso Python detectará el nuevo BPM automáticamente en ~1-2s
+            // Limpiar el buffer de mediana para que la canción nueva empiece sin historial
+            root._bpmBuffer = []
+            // El script Python detectará el nuevo BPM en ~1-2s, no hay que hacer nada más
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Display
+    // Zona visual
     // ══════════════════════════════════════════════════════════════════════
 
     AnimatedImage {
@@ -529,8 +654,8 @@ DraggableDesktopWidget {
         anchors.fill: parent
         source: root.gifUrl
         fillMode: AnimatedImage.PreserveAspectFit
-        // SIEMPRE controlado manualmente por frameTicker
-        // GIF congelado cuando no hay música — solo se mueve con canciones
+        // frameTicker lleva el control, no dejo que Qt lo mueva solo
+        // Si no hay música el GIF queda quieto (se ve atenuado al 40%)
         playing: false
         paused: true
         opacity: root.isMusicPlaying ? 1.0 : 0.4
@@ -543,15 +668,12 @@ DraggableDesktopWidget {
 
         onStatusChanged: {
             if (status === AnimatedImage.Ready) {
-                // Calcular FPS aproximado si no está configurado
+                // Si no hay metadatos de FPS, tiro una estimación rápida
                 var calculatedFPS = root.gifBaseFPS
                 if (frameCount > 0 && currentGif) {
-                    // Intentar detectar FPS real observando el GIF
-                    // La mayoría de GIFs tienen 30-60 FPS
-                    // Si no hay metadatos, estimar basado en frameCount
+                    // La mayoría de GIFs van a 30fps, sirve como base
                     try {
                         if (!pluginApi?.pluginSettings?.gifsMetadata || !pluginApi.pluginSettings.gifsMetadata[currentGif.filename]) {
-                            // Estimación simple: la mayoría son 30fps
                             calculatedFPS = 30.0
                             console.log("GIF Widget [" + widgetIndex + "]: FPS no configurado, usando estimación:", calculatedFPS)
                         }
@@ -575,7 +697,7 @@ DraggableDesktopWidget {
         }
     }
 
-    // Overlay - visible SOLO cuando no hay GIF asignado o hay error
+    // Fondo oscuro que aparece cuando no hay GIF o hay un error de carga
     Rectangle {
         anchors.fill: parent
         visible: currentGif === null || gifDisplay.status === AnimatedImage.Error
@@ -587,7 +709,7 @@ DraggableDesktopWidget {
             spacing: Math.round(12 * widgetScale)
             width: Math.min(parent.width - scaledMargin * 2, Math.round(280 * widgetScale))
 
-            // Icon
+            // Icono
             NIcon {
                 icon: "photo"
                 color: Color.mPrimary
@@ -596,7 +718,7 @@ DraggableDesktopWidget {
                 height: scaledIconSize
             }
 
-            // Widget info
+            // Título del widget
             NText {
                 Layout.fillWidth: true
                 text: "Widget #" + (widgetIndex + 1)
@@ -607,7 +729,7 @@ DraggableDesktopWidget {
                 font.weight: Font.DemiBold
             }
 
-            // ── Selector de GIF (solo cuando NO hay GIF asignado) ──────
+            // ── Selector de GIF (solo cuando el widget no tiene ninguno asignado) ──────
             ComboBox {
                 id: gifSelector
                 visible: currentGif === null && root.folderGifPaths.length > 0
@@ -649,7 +771,7 @@ DraggableDesktopWidget {
                 }
             }
 
-            // No hay GIFs en la carpeta
+            // Aviso de que no hay GIFs descargados todavía
             NText {
                 visible: root.folderGifPaths.length === 0
                 Layout.fillWidth: true
@@ -661,7 +783,7 @@ DraggableDesktopWidget {
                 wrapMode: Text.WordWrap
             }
 
-            // Error message
+            // Mensaje de error si el archivo no cargó bien
             NText {
                 visible: currentGif !== null && gifDisplay.status === AnimatedImage.Error
                 Layout.fillWidth: true
@@ -675,7 +797,7 @@ DraggableDesktopWidget {
         }
     }
 
-    // Indicador de carga (cuando GIF está asignado pero aún no ha cargado)
+    // Spinner de carga mientras el GIF todavía no ha terminado de cargarse
     Rectangle {
         anchors.centerIn: parent
         width: Math.round(120 * widgetScale)

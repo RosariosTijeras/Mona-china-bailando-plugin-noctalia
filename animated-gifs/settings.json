@@ -1,7 +1,29 @@
 {
   "gifFPS": 33.33,
-  "gifBPM": 120.0,
+  "gifBPM": 120,
   "manualBPM": -1,
   "bpmCaptureSecs": 5,
-  "tick": 3
+  "tick": 3,
+  "gifsMetadata": {
+    "2unv.gif": {
+      "fps": 20.0
+    },
+    "aivibing.gif": {
+      "fps": 10.0
+    },
+    "anime-dancing.gif": {
+      "fps": 33.33
+    },
+    "anime-danza-danza-anime.gif": {
+      "fps": 10,
+      "frames": 43,
+      "duration": 4.3
+    },
+    "cute-dance.gif": {
+      "fps": 33.33
+    },
+    "shika-shikanokonokonokoshitan.gif": {
+      "fps": 20.0
+    }
+  }
 }
